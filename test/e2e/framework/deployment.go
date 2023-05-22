@@ -37,6 +37,9 @@ const EchoService = "echo"
 // SlowEchoService name of the deployment for the echo app
 const SlowEchoService = "slow-echo"
 
+// AlwaysSlowEchoService name of the deployment for the always slow echo app
+const AlwaysSlowEchoService = "always-slow-echo"
+
 // HTTPBunService name of the deployment for the httpbun app
 const HTTPBunService = "httpbun"
 
@@ -58,6 +61,8 @@ type deploymentOptions struct {
 	image          string
 	replicas       int
 	svcAnnotations map[string]string
+	serviceName      string
+	duplicateService bool
 }
 
 // WithDeploymentNamespace allows configuring the deployment's namespace
@@ -103,16 +108,37 @@ func WithImage(i string) func(*deploymentOptions) {
 	}
 }
 
+// WithServiceName overrides the default service name connected to the deployment. To allow multiple deployments to
+// match the same service an additional tag is used for the pods and ignored by the specified service.
+func WithServiceName(s string) func(*deploymentOptions) {
+	return func(o *deploymentOptions) {
+		o.serviceName = s
+	}
+}
+
 // NewEchoDeployment creates a new single replica deployment of the echo server image in a particular namespace
 func (f *Framework) NewEchoDeployment(opts ...func(*deploymentOptions)) {
 	options := &deploymentOptions{
-		namespace: f.Namespace,
-		name:      EchoService,
-		replicas:  1,
-		image:     EchoImage,
+		namespace:   f.Namespace,
+		name:        EchoService,
+		replicas:    1,
+		image:       EchoImage,
+		serviceName: "",
 	}
 	for _, o := range opts {
 		o(options)
+	}
+
+	// If a serviceName is defined then pods from any app will be labelled such that the specified service matches them
+	podLabels := make(map[string]string)
+	selectorLabels := make(map[string]string)
+	podLabels["app"] = options.name
+	if options.serviceName == "" {
+		options.serviceName = options.name
+		selectorLabels["app"] = options.name
+	} else {
+		podLabels["service"] = options.serviceName
+		selectorLabels["service"] = options.serviceName
 	}
 
 	f.EnsureDeployment(newDeployment(
@@ -125,11 +151,12 @@ func (f *Framework) NewEchoDeployment(opts ...func(*deploymentOptions)) {
 		[]corev1.VolumeMount{},
 		[]corev1.Volume{},
 		true,
+		podLabels,
 	))
 
 	f.EnsureService(&corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        options.name,
+			Name:        options.serviceName,
 			Namespace:   options.namespace,
 			Annotations: options.svcAnnotations,
 		},
@@ -142,9 +169,7 @@ func (f *Framework) NewEchoDeployment(opts ...func(*deploymentOptions)) {
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
-			Selector: map[string]string{
-				"app": options.name,
-			},
+			Selector: selectorLabels,
 		},
 	})
 
@@ -223,6 +248,7 @@ func (f *Framework) NewHttpbunDeployment(opts ...func(*deploymentOptions)) strin
 		[]corev1.VolumeMount{},
 		[]corev1.Volume{},
 		true,
+		nil,
 	))
 
 	// Create a service pointing to deployment
@@ -269,6 +295,12 @@ func (f *Framework) NewHttpbunDeployment(opts ...func(*deploymentOptions)) strin
 
 // NewSlowEchoDeployment creates a new deployment of the slow echo server image in a particular namespace.
 func (f *Framework) NewSlowEchoDeployment() {
+	f.NewSlowEchoDeploymentWithOptions()
+	return
+}
+
+// NewSlowEchoDeploymentWithOptions creates a new deployment of the slow echo server with functional options.
+func (f *Framework) NewSlowEchoDeploymentWithOptions(opts ...func(*deploymentOptions)) {
 	cfg := `#
 events {
 	worker_connections  1024;
@@ -302,7 +334,44 @@ http {
 
 `
 
-	f.NGINXWithConfigDeployment(SlowEchoService, cfg)
+	f.NGINXWithConfigDeploymentWithOptions(SlowEchoService, cfg, true, opts...)
+}
+
+// NewAlwaysSlowEchoDeployment creates a new deployment of the always slow echo server. This server will always sleep
+// for the specified number of milliseconds before responding regardless of path.
+func (f *Framework) NewAlwaysSlowEchoDeployment(sleepMillis int) {
+	f.NewAlwaysSlowEchoDeploymentWithOptions(sleepMillis)
+	return
+}
+
+// NewAlwaysSlowEchoDeploymentWithOptions creates a new deployment of the always slow echo server with functional options.
+// This server always sleeps for the specified number of milliseconds before responding. NOTE: values for sleepMillis
+// >= 2000 will cause the deployment to fail health checks, causing false positive test failures.
+func (f *Framework) NewAlwaysSlowEchoDeploymentWithOptions(sleepMillis int, opts ...func(*deploymentOptions)) {
+	delay := float32(sleepMillis) * 0.001
+	cfg := fmt.Sprintf(`#
+events {
+	worker_connections  1024;
+	multi_accept on;
+}
+http {
+	default_type 'text/plain';
+	client_max_body_size 0;
+	server {
+		access_log on;
+		access_log /dev/stdout;
+		listen 80;
+		location / {
+			content_by_lua_block {
+				ngx.sleep(%.3f)
+				ngx.print("echo ok after %.3f seconds")
+			}
+		}
+	}
+}
+`, delay, delay)
+
+	f.NGINXWithConfigDeploymentWithOptions(AlwaysSlowEchoService, cfg, true, opts...)
 }
 
 func (f *Framework) GetNginxBaseImage() string {
@@ -318,27 +387,55 @@ func (f *Framework) GetNginxBaseImage() string {
 // NGINXDeployment creates a new simple NGINX Deployment using NGINX base image
 // and passing the desired configuration
 func (f *Framework) NGINXDeployment(name, cfg string, waitendpoint bool) {
+	f.NGINXDeploymentWithOptions(name, cfg, waitendpoint)
+	return
+}
+
+// NGINXDeploymentWithOptions creates a new simple NGINX Deployment using NGINX base image and the desired configuration,
+// with overrides applied by any supplied functional options.
+func (f *Framework) NGINXDeploymentWithOptions(name string, cfg string, waitendpoint bool, opts ...func(options *deploymentOptions)) {
 	cfgMap := map[string]string{
 		"nginx.conf": cfg,
+	}
+	options := &deploymentOptions{
+		namespace:   f.Namespace,
+		name:        name,
+		replicas:    1,
+		serviceName: "",
+	}
+	for _, o := range opts {
+		o(options)
+	}
+
+	// If a serviceName is defined then pods from any app will be labelled such that that service matches them
+	podLabels := make(map[string]string)
+	selectorLabels := make(map[string]string)
+	podLabels["app"] = options.name
+	if options.serviceName == "" {
+		options.serviceName = options.name
+		selectorLabels["app"] = options.name
+	} else {
+		podLabels["service"] = options.serviceName
+		selectorLabels["service"] = options.serviceName
 	}
 
 	_, err := f.KubeClientSet.
 		CoreV1().
-		ConfigMaps(f.Namespace).
+		ConfigMaps(options.namespace).
 		Create(context.TODO(), &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: f.Namespace,
+				Name:      options.name,
+				Namespace: options.namespace,
 			},
 			Data: cfgMap,
 		}, metav1.CreateOptions{})
 	assert.Nil(ginkgo.GinkgoT(), err, "creating configmap")
 
-	deployment := newDeployment(name, f.Namespace, f.GetNginxBaseImage(), 80, 1,
+	deployment := newDeployment(options.name, f.Namespace, f.GetNginxBaseImage(), 80, int32(options.replicas),
 		nil, nil, nil,
 		[]corev1.VolumeMount{
 			{
-				Name:      name,
+				Name:      options.name,
 				MountPath: "/etc/nginx/nginx.conf",
 				SubPath:   "nginx.conf",
 				ReadOnly:  true,
@@ -346,24 +443,24 @@ func (f *Framework) NGINXDeployment(name, cfg string, waitendpoint bool) {
 		},
 		[]corev1.Volume{
 			{
-				Name: name,
+				Name: options.name,
 				VolumeSource: corev1.VolumeSource{
 					ConfigMap: &corev1.ConfigMapVolumeSource{
 						LocalObjectReference: corev1.LocalObjectReference{
-							Name: name,
+							Name: options.name,
 						},
 					},
 				},
 			},
-		}, true,
+		}, true, podLabels,
 	)
 
 	f.EnsureDeployment(deployment)
 
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: f.Namespace,
+			Name:      options.serviceName,
+			Namespace: options.namespace,
 		},
 		Spec: corev1.ServiceSpec{
 			Ports: []corev1.ServicePort{
@@ -374,23 +471,35 @@ func (f *Framework) NGINXDeployment(name, cfg string, waitendpoint bool) {
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
-			Selector: map[string]string{
-				"app": name,
-			},
+			Selector: selectorLabels,
 		},
 	}
 
-	f.EnsureService(service)
+	// If a service name is provided then don't throw an error if it already exists
+	if options.serviceName == options.name {
+		f.EnsureService(service)
+	} else {
+		f.EnsureServiceExists(service)
+	}
 
 	if waitendpoint {
-		err = WaitForEndpoints(f.KubeClientSet, DefaultTimeout, name, f.Namespace, 1)
+		if options.serviceName == options.name {
+			err = WaitForEndpoints(f.KubeClientSet, DefaultTimeout, name, options.namespace, 1)
+		} else {
+			err = WaitForMinimumEndpoints(f.KubeClientSet, DefaultTimeout, options.serviceName, options.namespace, 1)
+		}
 		assert.Nil(ginkgo.GinkgoT(), err, "waiting for endpoints to become ready")
 	}
 }
 
 // NGINXWithConfigDeployment creates an NGINX deployment using a configmap containing the nginx.conf configuration
 func (f *Framework) NGINXWithConfigDeployment(name, cfg string) {
-	f.NGINXDeployment(name, cfg, true)
+	f.NGINXWithConfigDeploymentWithOptions(name, cfg, true)
+}
+
+// NGINXWithConfigDeploymentWithOptions creates an NGINX deployment with nginx.conf override and functional options
+func (f *Framework) NGINXWithConfigDeploymentWithOptions(name string, cfg string, waitendpoint bool, opts ...func(*deploymentOptions)) {
+	f.NGINXDeploymentWithOptions(name, cfg, waitendpoint, opts...)
 }
 
 // NewGRPCBinDeployment creates a new deployment of the
@@ -489,6 +598,13 @@ func (f *Framework) NewGRPCBinDeployment() {
 func newDeployment(name, namespace, image string, port int32, replicas int32, command []string, args []string, env []corev1.EnvVar,
 	volumeMounts []corev1.VolumeMount, volumes []corev1.Volume, setProbe bool,
 ) *appsv1.Deployment {
+
+	if podLabels == nil {
+		podLabels = map[string]string{
+			"app": name,
+		}
+	}
+
 	probe := &corev1.Probe{
 		InitialDelaySeconds: 2,
 		PeriodSeconds:       1,
@@ -511,15 +627,11 @@ func newDeployment(name, namespace, image string, port int32, replicas int32, co
 		Spec: appsv1.DeploymentSpec{
 			Replicas: NewInt32(replicas),
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app": name,
-				},
+				MatchLabels: podLabels,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app": name,
-					},
+					Labels: podLabels,
 				},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: NewInt64(0),
@@ -566,7 +678,7 @@ func (f *Framework) NewDeployment(name, image string, port, replicas int32) {
 
 // NewDeployment creates a new deployment in a particular namespace.
 func (f *Framework) NewDeploymentWithOpts(name, image string, port, replicas int32, command, args []string, env []corev1.EnvVar, volumeMounts []corev1.VolumeMount, volumes []corev1.Volume, setProbe bool) {
-	deployment := newDeployment(name, f.Namespace, image, port, replicas, command, args, env, volumeMounts, volumes, setProbe)
+	deployment := newDeployment(name, f.Namespace, image, port, replicas, command, args, env, volumeMounts, volumes, setProbe, nil)
 
 	f.EnsureDeployment(deployment)
 
