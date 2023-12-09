@@ -9,12 +9,15 @@ local string_format = string.format
 local ngx_log = ngx.log
 local DEBUG = ngx.DEBUG
 
+local TTL_1H = 60 * 60
 
 local _M = { name = "leastconn" }
 
 function _M.new(self, backend)
     local o = {
-        peers = backend.endpoints
+        peers = backend.endpoints,
+        traffic_shaping_policy = backend.trafficShapingPolicy,
+        alternative_backends = backend.alternativeBackends,
     }
     setmetatable(o, self)
     self.__index = self
@@ -43,10 +46,9 @@ function _M.balance(self)
         for _, peer in pairs(peers) do
             local peer_name = get_upstream_name(peer)
             local peer_conn_count = endpoints:get(peer_name)
-            if peer_conn_count  == nil then
-                -- Peer has never been recorded as having connections - add it to the connection
-                -- tracking table and the list of feasible peers
-                endpoints:set(peer_name,0,0)
+            if peer_conn_count == nil then
+                -- Peer has never been recorded as having connections -
+                -- add it to the list of feasible peers
                 lowestconns = 0
                 feasible_endpoints[#feasible_endpoints+1] = peer
             elseif peer_conn_count < lowestconns then
@@ -68,22 +70,29 @@ function _M.balance(self)
     ngx_log(DEBUG, "selected endpoint ", selected_endpoint)
 
     -- Update the endpoint connection count
-    endpoints:incr(selected_endpoint,1,1,0)
+    endpoints:incr(selected_endpoint, 1, 0, TTL_1H)
+    endpoints:expire(selected_endpoint, TTL_1H)
 
     return selected_endpoint
 end
 
 function _M.after_balance(_)
     local endpoints = ngx.shared.balancer_leastconn
-    local upstream = split.get_last_value(ngx.var.upstream_addr)
 
-    if util.is_blank(upstream) then
-        return
+    -- if nginx has tried multiple servers, it has put them all through the balancer above
+    -- so we need to tick off each server that has been tried, else they'll desync
+    for _, upstream in pairs(split.split_upstream_var(ngx.var.upstream_addr)) do
+        if not util.is_blank(upstream) then
+            endpoints:incr(upstream, -1)
+            endpoints:expire(upstream, TTL_1H)
+        end
     end
-    endpoints:incr(upstream,-1,0,0)
 end
 
 function _M.sync(self, backend)
+    self.traffic_shaping_policy = backend.trafficShapingPolicy
+    self.alternative_backends = backend.alternativeBackends
+
     local normalized_endpoints_added, normalized_endpoints_removed =
         util.diff_endpoints(self.peers, backend.endpoints)
 
@@ -94,15 +103,6 @@ function _M.sync(self, backend)
     ngx_log(DEBUG, string_format("[%s] peers have changed for backend %s", self.name, backend.name))
 
     self.peers = backend.endpoints
-
-    for _, endpoint_string in ipairs(normalized_endpoints_removed) do
-        ngx.shared.balancer_leastconn:delete(endpoint_string)
-    end
-
-    for _, endpoint_string in ipairs(normalized_endpoints_added) do
-        ngx.shared.balancer_leastconn:set(endpoint_string,0,0)
-    end
-
 end
 
 return _M
